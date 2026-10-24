@@ -55,6 +55,8 @@ offline singing · auto-prefetch next 3 songs · local library with covers & lyr
 | 7 | **环境隔离** | 应用改用独立端口 14201 与固定自签证书，避免与官方版抢端口、反复弹钥匙串密码 |
 | 8 | **外挂下载器** | 另一套不改动原 App 的下载工具（Python + 本地网页界面） |
 | 9 | **图标与快捷方式** | 重新绘制麦克风+下载箭头图标，配置桌面 / Dock 快捷方式 |
+| 10 | **修上游未通过的测试** | 补丁把 schema 版本推到 14 后，上游测试 `test_schema_version_is_13…` 会失败；已改为 14 并新增迁移 14 的列断言（现在 173 个测试全绿） |
+| 11 | **切断官方更新源** | 应用内自动更新的地址原本指向官方 release，会把本构建覆盖回官方版（下载功能消失）；已指向本仓库 |
 
 代码层面：`services/downloader.rs`、`commands/downloads.rs`、数据库迁移 14、
 `downloadStore` + `DownloadPanel`、搜索行按钮、曲库封面兜底等，共 18 个文件、约 1300 行新增。
