@@ -2122,6 +2122,51 @@ index 92d3239..e0043d7 100644
                    {video.artist && (
                      <p className="text-xs text-gray-400 truncate">{video.artist}</p>
                    )}
+diff --git a/src/components/player/PlayerControls.tsx b/src/components/player/PlayerControls.tsx
+index 2a0323e..8f2e3c0 100644
+--- a/src/components/player/PlayerControls.tsx
++++ b/src/components/player/PlayerControls.tsx
+@@ -1,3 +1,4 @@
++import { useDownloadStore, usePrefetchStore } from "../../stores";
+ import { useRef, useCallback, useEffect } from "react";
+ import { convertFileSrc } from "@tauri-apps/api/core";
+ import { usePlayerStore, useQueueStore, useSessionStore, useSettingsStore, SETTINGS_KEYS, parseOverlaySeconds, playVideo, notify, toStreamUrls } from "../../stores";
+@@ -671,9 +672,32 @@ export function PlayerControls() {
+ 
+       {/* Video info */}
+       <div className="mt-2 text-sm">
+-        <p className="font-medium truncate">
+-          {currentVideo?.title || "No video selected"}
+-        </p>
++        <div className="flex items-center gap-2">
++          <p className="font-medium truncate">
++            {currentVideo?.title || "No video selected"}
++          </p>
++          {currentVideo && (
++            <button
++              onClick={(e) => {
++                e.stopPropagation();
++                const video = currentVideo;
++                const videoId = video.youtubeId ?? video.id;
++                void (async () => {
++                  if (await usePrefetchStore.getState().cachedPath(videoId)) return;
++                  void useDownloadStore.getState().start({
++                    videoId,
++                    title: video.title,
++                    artist: video.artist,
++                  });
++                })();
++              }}
++              className="shrink-0 rounded bg-indigo-600/80 px-2 py-0.5 text-xs hover:bg-indigo-500"
++              title="把正在播放的这首下载到本地曲库（可离线唱）"
++            >
++              ⤓ 下载
++            </button>
++          )}
++        </div>
+         {currentVideo?.artist && (
+           <p className="text-gray-400 truncate">{currentVideo.artist}</p>
+         )}
 diff --git a/src/components/player/VideoPlayer.tsx b/src/components/player/VideoPlayer.tsx
 index 32a587b..7e5120c 100644
 --- a/src/components/player/VideoPlayer.tsx
@@ -2154,6 +2199,47 @@ index 32a587b..7e5120c 100644
        const isLocalFile = nextItem.video.source === "local" && nextItem.video.filePath;
        const isYouTubeVideo = !!nextItem.video.youtubeId;
  
+diff --git a/src/components/queue/DraggableQueueItem.tsx b/src/components/queue/DraggableQueueItem.tsx
+index fc6d3fd..fe4b19f 100644
+--- a/src/components/queue/DraggableQueueItem.tsx
++++ b/src/components/queue/DraggableQueueItem.tsx
+@@ -2,7 +2,7 @@ import { useEffect } from "react";
+ import { useSortable } from "@dnd-kit/sortable";
+ import { CSS } from "@dnd-kit/utilities";
+ import type { QueueItem } from "../../stores/queueStore";
+-import { useSessionStore, usePlayerStore, useSettingsStore, SETTINGS_KEYS } from "../../stores";
++import { useSessionStore, usePlayerStore, useSettingsStore, useDownloadStore, usePrefetchStore, SETTINGS_KEYS } from "../../stores";
+ import { SingerAvatar, SingerPicker } from "../singers";
+ 
+ interface DraggableQueueItemProps {
+@@ -135,6 +135,27 @@ export function DraggableQueueItem({
+       {/* Singer picker (only when session active) */}
+       {session && <SingerPicker queueItemId={item.id} />}
+ 
++      {/* Download button */}
++      <button
++        onClick={(e) => {
++          e.stopPropagation();
++          const videoId = item.video.youtubeId ?? item.video.id;
++          void (async () => {
++            if (await usePrefetchStore.getState().cachedPath(videoId)) return;
++            void useDownloadStore.getState().start({
++              videoId,
++              title: item.video.title,
++              artist: item.video.artist,
++            });
++          })();
++        }}
++        className="text-gray-400 hover:text-indigo-400 text-sm px-1"
++        aria-label="Download to local library"
++        title="下载到本地曲库（可离线唱）"
++      >
++        ⤓
++      </button>
++
+       {/* Play button */}
+       <button
+         onClick={(e) => {
 diff --git a/src/components/search/LocalSearchResults.tsx b/src/components/search/LocalSearchResults.tsx
 index 6de12a2..f09905f 100644
 --- a/src/components/search/LocalSearchResults.tsx
@@ -2386,10 +2472,10 @@ index fe63f38..f748407 100644
  /**
 diff --git a/src/stores/downloadStore.ts b/src/stores/downloadStore.ts
 new file mode 100644
-index 0000000..da1259e
+index 0000000..ffdf2c3
 --- /dev/null
 +++ b/src/stores/downloadStore.ts
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,189 @@
 +import { create } from "zustand";
 +import { downloadService, createLogger, type DownloadInfo, type DownloadProgress } from "../services";
 +import { notify } from "./notificationStore";
@@ -2499,6 +2585,7 @@ index 0000000..da1259e
 +  },
 +
 +  start: async (params) => {
++    log.info(`start requested: ${params.videoId} (${params.silent ? "prefetch" : "user"})`);
 +    try {
 +      const downloadId = await downloadService.start(params);
 +      set((state) => ({
