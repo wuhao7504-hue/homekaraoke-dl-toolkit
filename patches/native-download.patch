@@ -692,10 +692,10 @@ index b01231f..1788311 100644
              commands::get_debug_mode,
 diff --git a/src-tauri/src/services/downloader.rs b/src-tauri/src/services/downloader.rs
 new file mode 100644
-index 0000000..026c2e3
+index 0000000..ae09542
 --- /dev/null
 +++ b/src-tauri/src/services/downloader.rs
-@@ -0,0 +1,901 @@
+@@ -0,0 +1,1025 @@
 +//! Download service — saves YouTube videos into the local library folder and
 +//! reports progress to the frontend through the `download:progress` event.
 +//!
@@ -707,6 +707,7 @@ index 0000000..026c2e3
 +//! - Output file name is `Artist - Title.ext`, which is exactly the convention
 +//!   `LibraryScanner::parse_filename` understands.
 +
++use log::{info, warn};
 +use serde::Serialize;
 +use std::collections::HashMap;
 +use std::path::{Path, PathBuf};
@@ -862,6 +863,19 @@ index 0000000..026c2e3
 +///
 +/// Background work only takes the slot while no user download is waiting, so a
 +/// prefetch run can never make a clicked download sit through three songs.
++struct UserWaiter;
++impl UserWaiter {
++    fn new() -> Self {
++        USER_WAITING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++        Self
++    }
++}
++impl Drop for UserWaiter {
++    fn drop(&mut self) {
++        USER_WAITING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
++    }
++}
++
 +async fn acquire_slot(priority: Priority) -> tokio::sync::OwnedMutexGuard<()> {
 +    use std::sync::atomic::Ordering;
 +    use std::sync::Arc;
@@ -871,9 +885,8 @@ index 0000000..026c2e3
 +
 +    match priority {
 +        Priority::User => {
-+            USER_WAITING.fetch_add(1, Ordering::SeqCst);
++            let _waiter = UserWaiter::new();
 +            let guard = lock.lock_owned().await;
-+            USER_WAITING.fetch_sub(1, Ordering::SeqCst);
 +            guard
 +        }
 +        Priority::Background => {
@@ -1056,6 +1069,8 @@ index 0000000..026c2e3
 +    cookies: &CookieSource,
 +    robust: bool,
 +    pot_base: Option<&str>,
++    client: Option<&str>,
++    forced_format: Option<&str>,
 +) -> Vec<String> {
 +    let url = format!("https://www.youtube.com/watch?v={}", video_id);
 +    let out_template = dir.join(format!("{}.%(ext)s", stem));
@@ -1089,8 +1104,18 @@ index 0000000..026c2e3
 +        "-o".into(),
 +        out_template.to_string_lossy().to_string(),
 +        "-f".into(),
-+        quality.format_selector().into(),
++        forced_format
++            .map(|f| f.to_string())
++            .unwrap_or_else(|| quality.format_selector().to_string()),
 +    ]);
++
++    // 客户端轮换：默认客户端对 DASH 格式会中途 403，web_safari / mweb 目前可过
++    if let Some(client) = client {
++        args.extend([
++            "--extractor-args".into(),
++            format!("youtube:player_client={client}"),
++        ]);
++    }
 +
 +    if quality.is_audio() {
 +        args.extend(["-x".into(), "--audio-format".into(), "m4a".into()]);
@@ -1255,14 +1280,27 @@ index 0000000..026c2e3
 +    let stem = output_stem(&title, artist.as_deref());
 +
 +    // 排队：拿到全局锁之前，前端保持「排队中」
++    info!("download[{download_id}]: waiting for slot ({priority:?})");
 +    let _serial = acquire_slot(priority).await;
++    info!("download[{download_id}]: slot acquired");
 +    let _ = download_lock();
 +
 +    let pot_base = pot_base_url();
-+    let started = Instant::now();
-+    let mut attempt = 0usize;
 +
-+    loop {
++    // 403 阶梯：默认客户端 → web_safari → mweb → 保底渐进式格式(360p)
++    // 实测（2026-10）：默认 web 客户端下载 DASH 格式约 5MB 后必 403，
++    // web_safari / mweb 可正常取全流；最后用 muxed 18 号格式兜底保证有文件。
++    // 保底格式要跟着质量走：音频模式退到 ba/b，视频模式退到 muxed 18
++    let fallback_format = if quality.is_audio() { "ba/b" } else { "18/b" };
++    let strategies: [(Option<&str>, Option<&str>, &str); 4] = [
++        (None, None, "默认客户端"),
++        (Some("web_safari"), None, "web_safari"),
++        (Some("mweb"), None, "mweb"),
++        (Some("web_safari"), Some(fallback_format), "保底格式"),
++    ];
++
++    let mut last_error = String::new();
++    for (idx, (client, forced_format, label)) in strategies.iter().enumerate() {
 +        emit_progress(
 +            &app,
 +            DownloadProgress {
@@ -1271,10 +1309,10 @@ index 0000000..026c2e3
 +                title: title.clone(),
 +                status: "downloading".into(),
 +                percent: 0.0,
-+                speed: if attempt > 0 {
-+                    format!("重试 {}/{}", attempt, RETRY_DELAYS.len())
-+                } else {
++                speed: if idx == 0 {
 +                    String::new()
++                } else {
++                    format!("换策略 {}/{}：{}", idx + 1, strategies.len(), label)
 +                },
 +                eta: String::new(),
 +                error: None,
@@ -1291,90 +1329,114 @@ index 0000000..026c2e3
 +            &cookies,
 +            robust,
 +            pot_base.as_deref(),
++            *client,
++            *forced_format,
 +        );
-+        let (status, stderr_lines) = run_ytdlp(&app, &ytdlp, &args, &download_id, &video_id, &title).await;
++
++        info!(
++            "download[{download_id}]: attempt {}/{} with {}",
++            idx + 1,
++            strategies.len(),
++            label
++        );
++
++        let outcome = match tokio::time::timeout(
++            std::time::Duration::from_secs(15 * 60),
++            run_ytdlp(&app, &ytdlp, &args, &download_id, &video_id, &title),
++        )
++        .await
++        {
++            Ok(result) => result,
++            Err(_) => {
++                manager().cancel(&download_id);
++                emit_progress(
++                    &app,
++                    DownloadProgress {
++                        download_id: download_id.clone(),
++                        video_id: video_id.clone(),
++                        title: title.clone(),
++                        status: "failed".into(),
++                        percent: 0.0,
++                        speed: String::new(),
++                        eta: String::new(),
++                        error: Some("下载超时（15 分钟），已终止".into()),
++                        file_path: None,
++                        needs_restart: None,
++                    },
++                );
++                clear_inflight(&video_id);
++                return Err("下载超时（15 分钟），已终止".to_string());
++            }
++        };
++        let (status, stderr_lines) = outcome;
 +
 +        if status.success() {
 +            clear_inflight(&video_id);
 +            let path = find_output(&dir, &stem)
 +                .ok_or_else(|| "yt-dlp 结束但没有产出文件".to_string())?;
-+            emit_progress(
-+                &app,
-+                DownloadProgress {
-+                    download_id,
-+                    video_id,
-+                    title,
-+                    status: "completed".into(),
-+                    percent: 100.0,
-+                    speed: String::new(),
-+                    eta: String::new(),
-+                    error: None,
-+                    file_path: Some(path.to_string_lossy().to_string()),
-+                    needs_restart: None,
-+                },
-+            );
-+            return Ok(path);
-+        }
-+
-+        let joined = stderr_lines.join(" | ");
-+        let is_403 = joined.contains("403");
-+        let is_bot_check = joined.contains("Sign in to confirm");
-+
-+        if is_403 {
-+            record_403();
-+        }
-+
-+        // 403 = 票失效（可重开），按阶梯退避重试；bot 校验重试无意义
-+        if robust && is_403 && !is_bot_check && attempt < RETRY_DELAYS.len() {
-+            let wait = RETRY_DELAYS[attempt];
-+            attempt += 1;
++            let done_path = path.to_string_lossy().to_string();
 +            emit_progress(
 +                &app,
 +                DownloadProgress {
 +                    download_id: download_id.clone(),
 +                    video_id: video_id.clone(),
 +                    title: title.clone(),
-+                    status: "downloading".into(),
-+                    percent: 0.0,
-+                    speed: format!("403，{}s 后重试 {}/{}", wait, attempt, RETRY_DELAYS.len()),
++                    status: "completed".into(),
++                    percent: 100.0,
++                    speed: String::new(),
 +                    eta: String::new(),
 +                    error: None,
-+                    file_path: None,
++                    file_path: Some(done_path),
 +                    needs_restart: None,
 +                },
 +            );
-+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-+            continue;
++            info!("download[{download_id}]: done via {label} -> {:?}", path);
++            return Ok(path);
 +        }
 +
-+        let detail = stderr_lines
++        let joined = stderr_lines.join(" | ");
++        let is_403 = joined.contains("403");
++        let is_bot = joined.contains("Sign in to confirm");
++        last_error = stderr_lines
 +            .last()
 +            .cloned()
 +            .unwrap_or_else(|| format!("yt-dlp 退出码 {:?}", status.code()));
-+        let breaker = cooldown_remaining();
-+        let detail = if breaker > 0 {
-+            format!("{detail}（403 过多，已进入冷却 {} 秒）", breaker)
-+        } else {
-+            detail
-+        };
-+        emit_progress(
-+            &app,
-+            DownloadProgress {
-+                download_id,
-+                video_id,
-+                title,
-+                status: "failed".into(),
-+                percent: 0.0,
-+                speed: String::new(),
-+                eta: String::new(),
-+                error: Some(detail.clone()),
-+                file_path: None,
-+                needs_restart: None,
-+            },
-+        );
-+        let _ = started;
-+        return Err(detail);
++        warn!("download[{download_id}]: attempt {label} failed: {last_error}");
++
++        eprintln!("[downloader] attempt {label} failed: {last_error}");
++
++        // bot 校验换客户端也没用，直接结束；其余（403 / 该客户端没有这个格式）都继续下一策略
++        if is_bot || joined.contains("Video unavailable") || joined.contains("Private video") {
++            break;
++        }
++        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 +    }
++
++    // 所有策略都失败：记一次 403 并上报
++    record_403();
++    clear_inflight(&video_id);
++    let breaker = cooldown_remaining();
++    let detail = if breaker > 0 {
++        format!("{last_error}（403 过多，已进入冷却 {} 秒）", breaker)
++    } else {
++        last_error
++    };
++    emit_progress(
++        &app,
++        DownloadProgress {
++            download_id,
++            video_id,
++            title,
++            status: "failed".into(),
++            percent: 0.0,
++            speed: String::new(),
++            eta: String::new(),
++            error: Some(detail.clone()),
++            file_path: None,
++            needs_restart: None,
++        },
++    );
++    Err(detail)
 +}
 +
 +/// Run yt-dlp once, streaming progress events; returns (status, stderr tail).
@@ -1533,6 +1595,63 @@ index 0000000..026c2e3
 +        assert!(inflight_for("vid-1").is_none());
 +    }
 +
++    /// 两个下载并发时必须都完成（槽位串行 + 去重不能互相卡死）
++    #[tokio::test]
++    #[ignore]
++    async fn two_concurrent_downloads_both_finish() {
++        let app = tauri::test::mock_app();
++        let handle = app.handle().clone();
++        let dir = std::env::temp_dir().join("hkdl-concurrent-e2e");
++        let _ = std::fs::remove_dir_all(&dir);
++
++        let mk = |id: &str, vid: &str, dir: std::path::PathBuf, h: tauri::AppHandle<tauri::test::MockRuntime>| {
++            let id = id.to_string();
++            let vid = vid.to_string();
++            async move {
++                download(
++                    h,
++                    id,
++                    vid,
++                    "并发测试".to_string(),
++                    Some("probe".to_string()),
++                    dir,
++                    Quality::AudioOnly,
++                    CookieSource::None,
++                    Priority::User,
++                    true,
++                )
++                .await
++            }
++        };
++
++        let (a, b) = tokio::join!(
++            mk("c1", "t2CbuI1C3ZQ", dir.clone(), handle.clone()),
++            mk("c2", "UTbOtuoUV8c", dir.clone(), handle.clone()),
++        );
++        assert!(a.is_ok(), "first download failed: {:?}", a.err());
++        assert!(b.is_ok(), "second download failed: {:?}", b.err());
++        println!("both finished: {:?} {:?}", a.unwrap(), b.unwrap());
++    }
++
++    #[test]
++    fn build_args_can_rotate_client_and_force_format() {
++        let args = build_args(
++            "abc123",
++            Path::new("/tmp/lib"),
++            "A - B",
++            Quality::Best1080,
++            &CookieSource::None,
++            true,
++            None,
++            Some("web_safari"),
++            Some("18/b"),
++        );
++        assert!(args
++            .windows(2)
++            .any(|w| w[0] == "--extractor-args" && w[1] == "youtube:player_client=web_safari"));
++        assert!(args.windows(2).any(|w| w[0] == "-f" && w[1] == "18/b"));
++    }
++
 +    #[test]
 +    fn retry_ladder_is_exponential() {
 +        assert_eq!(RETRY_DELAYS, [8, 30, 120]);
@@ -1553,6 +1672,8 @@ index 0000000..026c2e3
 +            Quality::P720,
 +            &CookieSource::None,
 +            true,
++            None,
++            None,
 +            None,
 +        );
 +        assert!(args.iter().any(|a| a.contains("A - B.%(ext)s")));
@@ -1582,7 +1703,10 @@ index 0000000..026c2e3
 +            Some("周杰倫".to_string()),
 +            dir,
 +            Quality::AudioOnly,
-+            CookieSource::None,
++            match std::env::var("HKDL_COOKIES") {
++                Ok(path) if !path.is_empty() => CookieSource::File(path),
++                _ => CookieSource::None,
++            },
 +            Priority::User,
 +            true,
 +        )
