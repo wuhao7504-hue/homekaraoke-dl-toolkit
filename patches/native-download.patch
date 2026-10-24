@@ -1,0 +1,1505 @@
+diff --git a/src-tauri/Cargo.toml b/src-tauri/Cargo.toml
+index 8d61bdc..e38486b 100644
+--- a/src-tauri/Cargo.toml
++++ b/src-tauri/Cargo.toml
+@@ -31,7 +31,6 @@ tauri-plugin-fs = "2"
+ tauri-plugin-opener = "2"
+ url = "2"
+ urlencoding = "2"
+-keepawake = "0.5"
+ sha2 = "0.10"
+ # Use rustls-tls instead of native-tls to fix macOS TLS connection timeouts with Lrclib API
+ # See: https://github.com/zalun/karaoke-app/issues/133
+@@ -57,3 +56,6 @@ souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"]
+ [target.'cfg(target_os = "windows")'.dependencies]
+ souvlaki = "0.8"
+ keyring = { version = "3", features = ["windows-native"] }
++
++[dev-dependencies]
++tauri = { version = "2", features = ["test"] }
+diff --git a/src-tauri/src/commands/downloads.rs b/src-tauri/src/commands/downloads.rs
+new file mode 100644
+index 0000000..4089ecc
+--- /dev/null
++++ b/src-tauri/src/commands/downloads.rs
+@@ -0,0 +1,303 @@
++//! Download commands — download a YouTube song into the local library.
++//!
++//! `youtube_download` returns immediately with a download id; progress arrives
++//! through the `download:progress` event emitted by the downloader service.
++
++use std::path::PathBuf;
++
++use log::{debug, info, warn};
++use tauri::{AppHandle, Manager, State};
++
++use crate::commands::errors::CommandError;
++use crate::db::Database;
++use crate::services::downloader::{self, Quality};
++use crate::services::{LibraryFolder, LibraryScanner, ScanOptions};
++use crate::AppState;
++
++/// Resolve the download folder: `download_dir` setting, else `<audio>/HomeKaraoke`.
++fn resolve_download_dir(state: &AppState, app: &AppHandle) -> Result<PathBuf, CommandError> {
++    let configured = {
++        let db = state
++            .db
++            .lock()
++            .map_err(|_| CommandError::DatabaseLock("download_dir".into()))?;
++        db.get_setting("download_dir").ok().flatten()
++    };
++
++    if let Some(dir) = configured.filter(|d| !d.trim().is_empty()) {
++        return Ok(PathBuf::from(dir));
++    }
++
++    let base = app
++        .path()
++        .audio_dir()
++        .map_err(|e| CommandError::External(format!("无法定位音乐目录: {e}")))?;
++    Ok(base.join("HomeKaraoke"))
++}
++
++fn resolve_quality(state: &AppState) -> Quality {
++    let value = state
++        .db
++        .lock()
++        .ok()
++        .and_then(|db| db.get_setting("download_quality").ok().flatten());
++    Quality::from_str(value.as_deref().unwrap_or("1080p"))
++}
++
++/// Make sure HomeKaraoke knows about the folder (also feeds the asset:// scope
++/// on the next app start). Returns true when the folder is new.
++fn ensure_library_folder(state: &AppState, dir: &PathBuf) -> Result<bool, CommandError> {
++    let path = dir.to_string_lossy().to_string();
++    let name = dir
++        .file_name()
++        .map(|n| n.to_string_lossy().to_string())
++        .unwrap_or_else(|| path.clone());
++    let db = state
++        .db
++        .lock()
++        .map_err(|_| CommandError::DatabaseLock("library_folders".into()))?;
++    let conn = db.connection();
++    let existing: Option<i64> = conn
++        .query_row(
++            "SELECT id FROM library_folders WHERE path = ?1",
++            [&path],
++            |row| row.get(0),
++        )
++        .ok();
++    if existing.is_some() {
++        return Ok(false);
++    }
++    conn.execute(
++        "INSERT INTO library_folders (path, name) VALUES (?1, ?2)",
++        rusqlite::params![path, name],
++    )?;
++    Ok(true)
++}
++
++/// Register the finished file in `videos` so it shows up in Local straight away.
++fn register_video(
++    state: &AppState,
++    file_path: &str,
++    video_id: &str,
++    title: &str,
++    artist: Option<&str>,
++    quality: Quality,
++    needs_restart: bool,
++) -> Result<(), CommandError> {
++    let thumbnail = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", video_id);
++    let size = std::fs::metadata(file_path).map(|m| m.len() as i64).unwrap_or(0);
++    let db = state
++        .db
++        .lock()
++        .map_err(|_| CommandError::DatabaseLock("videos".into()))?;
++    let conn = db.connection();
++
++    let existing_id: Option<i64> = conn
++        .query_row(
++            "SELECT id FROM videos WHERE file_path = ?1",
++            [file_path],
++            |row| row.get(0),
++        )
++        .ok()
++        .or_else(|| {
++            conn.query_row(
++                "SELECT id FROM videos WHERE youtube_id = ?1",
++                [video_id],
++                |row| row.get(0),
++            )
++            .ok()
++        });
++
++    match existing_id {
++        Some(id) => {
++            conn.execute(
++                "UPDATE videos SET source_type='local', file_path=?1, title=?2,
++                 artist=COALESCE(NULLIF(?3,''), artist),
++                 thumbnail_url=COALESCE(thumbnail_url, ?4)
++                 WHERE id=?5",
++                rusqlite::params![file_path, title, artist.unwrap_or(""), thumbnail, id],
++            )?;
++        }
++        None => {
++            conn.execute(
++                "INSERT INTO videos (youtube_id, title, artist, source_type, file_path, thumbnail_url)
++                 VALUES (?1, ?2, ?3, 'local', ?4, ?5)",
++                rusqlite::params![video_id, title, artist, file_path, thumbnail],
++            )?;
++        }
++    }
++
++    conn.execute(
++        "INSERT INTO download_queue (youtube_id, youtube_title, status, progress_percent,
++             file_path, quality, file_size_bytes, download_id, completed_at)
++         VALUES (?1, ?2, 'completed', 100, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
++         ON CONFLICT(youtube_id) DO UPDATE SET status='completed', progress_percent=100,
++             file_path=?3, quality=?4, file_size_bytes=?5, download_id=?6,
++             error_message=NULL, completed_at=CURRENT_TIMESTAMP",
++        rusqlite::params![
++            video_id,
++            title,
++            file_path,
++            quality.as_str(),
++            size,
++            if needs_restart { "restart-needed" } else { "" }
++        ],
++    )?;
++    Ok(())
++}
++
++/// Run the library scanner for the download folder so `.hkmeta.json` and
++/// thumbnails get generated by the normal pipeline.
++fn scan_after_download(state: &AppState, dir: &PathBuf) {
++    let path = dir.to_string_lossy().to_string();
++    let folder = {
++        let Ok(db) = state.db.lock() else { return };
++        let conn = db.connection();
++        conn.query_row(
++            "SELECT id, path, COALESCE(name, path), last_scan_at, COALESCE(file_count, 0)
++             FROM library_folders WHERE path = ?1",
++            [&path],
++            |row| {
++                Ok(LibraryFolder {
++                    id: row.get(0)?,
++                    path: row.get(1)?,
++                    name: row.get(2)?,
++                    last_scan_at: row.get(3)?,
++                    file_count: row.get::<_, i64>(4)? as u32,
++                })
++            },
++        )
++        .ok()
++    };
++    let Some(folder) = folder else { return };
++    let options = ScanOptions {
++        create_hkmeta: true,
++        fetch_song_info: true,
++        fetch_lyrics: true,
++        regenerate: false,
++        generate_thumbnails: true,
++    };
++    let result = LibraryScanner::scan_folder(&folder, &options);
++    info!(
++        "post-download scan: {} files, {} hkmeta, {} thumbnails, {} errors",
++        result.files_found,
++        result.hkmeta_created,
++        result.thumbnails_generated,
++        result.errors.len()
++    );
++}
++
++#[tauri::command]
++pub async fn youtube_download(
++    app: AppHandle,
++    state: State<'_, AppState>,
++    video_id: String,
++    title: String,
++    artist: Option<String>,
++    quality: Option<String>,
++) -> Result<String, CommandError> {
++    debug!("youtube_download: video_id='{}'", video_id);
++
++    let dir = resolve_download_dir(&state, &app)?;
++    let quality = quality
++        .as_deref()
++        .map(Quality::from_str)
++        .unwrap_or_else(|| resolve_quality(&state));
++    let needs_restart = ensure_library_folder(&state, &dir)?;
++    if needs_restart {
++        warn!(
++            "download folder {} registered for the first time — restart to play offline",
++            dir.display()
++        );
++    }
++
++    let download_id = downloader::new_download_id();
++    let id_for_task = download_id.clone();
++    let app_for_task = app.clone();
++    let dir_for_task = dir.clone();
++    let title_for_task = title.clone();
++    let artist_for_task = artist.clone();
++
++    tauri::async_runtime::spawn(async move {
++        let result = downloader::download(
++            app_for_task.clone(),
++            id_for_task.clone(),
++            video_id.clone(),
++            title_for_task.clone(),
++            artist_for_task.clone(),
++            dir_for_task.clone(),
++            quality,
++        )
++        .await;
++
++        match result {
++            Ok(path) => {
++                let path_str = path.to_string_lossy().to_string();
++                info!("download completed: {}", path_str);
++                let state = app_for_task.state::<AppState>();
++                if let Err(err) = register_video(
++                    &state,
++                    &path_str,
++                    &video_id,
++                    &title_for_task,
++                    artist_for_task.as_deref(),
++                    quality,
++                    needs_restart,
++                ) {
++                    warn!("failed to register downloaded video: {err}");
++                }
++                scan_after_download(&state, &dir_for_task);
++            }
++            Err(err) => warn!("download failed: {err}"),
++        }
++    });
++
++    Ok(download_id)
++}
++
++#[tauri::command]
++pub fn download_cancel(download_id: String) -> Result<bool, CommandError> {
++    debug!("download_cancel: '{}'", download_id);
++    Ok(downloader::manager().cancel(&download_id))
++}
++
++#[derive(serde::Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct DownloadRow {
++    pub youtube_id: String,
++    pub title: String,
++    pub status: String,
++    pub progress_percent: i64,
++    pub error_message: Option<String>,
++    pub file_path: Option<String>,
++    pub completed_at: Option<String>,
++}
++
++#[tauri::command]
++pub fn download_list(state: State<'_, AppState>) -> Result<Vec<DownloadRow>, CommandError> {
++    let db: std::sync::MutexGuard<'_, Database> = state
++        .db
++        .lock()
++        .map_err(|_| CommandError::DatabaseLock("download_queue".into()))?;
++    let conn = db.connection();
++    let mut stmt = conn.prepare(
++        "SELECT COALESCE(youtube_id, ''), COALESCE(youtube_title, ''), COALESCE(status, 'pending'),
++                COALESCE(progress_percent, 0), error_message, file_path, completed_at
++         FROM download_queue ORDER BY id DESC LIMIT 100",
++    )?;
++    let rows = stmt
++        .query_map([], |row| {
++            Ok(DownloadRow {
++                youtube_id: row.get(0)?,
++                title: row.get(1)?,
++                status: row.get(2)?,
++                progress_percent: row.get(3)?,
++                error_message: row.get(4)?,
++                file_path: row.get(5)?,
++                completed_at: row.get(6)?,
++            })
++        })?
++        .filter_map(|r| r.ok())
++        .collect();
++    Ok(rows)
++}
+diff --git a/src-tauri/src/commands/keep_awake.rs b/src-tauri/src/commands/keep_awake.rs
+index 2ef9ea0..005456f 100644
+--- a/src-tauri/src/commands/keep_awake.rs
++++ b/src-tauri/src/commands/keep_awake.rs
+@@ -1,4 +1,5 @@
+ use super::errors::CommandError;
++use crate::services::keep_awake::KeepAwake;
+ use crate::AppState;
+ use tauri::State;
+ 
+@@ -10,13 +11,7 @@ pub fn keep_awake_enable(state: State<AppState>) -> Result<(), CommandError> {
+         .map_err(|_| CommandError::MutexPoisoned("Keep awake"))?;
+ 
+     if guard.is_none() {
+-        let awake = keepawake::Builder::default()
+-            .display(true)
+-            .idle(true)
+-            .reason("HomeKaraoke video playing")
+-            .app_name("HomeKaraoke")
+-            .app_reverse_domain("app.homekaraoke")
+-            .create()
++        let awake = KeepAwake::create(true, true)
+             .map_err(|e| CommandError::External(format!("Failed to enable keep awake: {}", e)))?;
+ 
+         *guard = Some(awake);
+diff --git a/src-tauri/src/commands/mod.rs b/src-tauri/src/commands/mod.rs
+index d7dbdae..5cb2e57 100644
+--- a/src-tauri/src/commands/mod.rs
++++ b/src-tauri/src/commands/mod.rs
+@@ -1,5 +1,6 @@
+ pub mod auth;
+ pub mod display;
++pub mod downloads;
+ pub mod errors;
+ pub mod favorites;
+ pub mod keep_awake;
+@@ -14,6 +15,7 @@ pub mod youtube;
+ 
+ pub use auth::*;
+ pub use display::*;
++pub use downloads::*;
+ pub use favorites::*;
+ pub use keep_awake::*;
+ pub use library::*;
+diff --git a/src-tauri/src/db/schema.rs b/src-tauri/src/db/schema.rs
+index d967576..9c7dece 100644
+--- a/src-tauri/src/db/schema.rs
++++ b/src-tauri/src/db/schema.rs
+@@ -329,6 +329,14 @@ const MIGRATIONS: &[&str] = &[
+     ALTER TABLE singers ADD COLUMN online_id TEXT;
+     CREATE INDEX IF NOT EXISTS idx_singers_online_id ON singers(online_id);
+     "#,
++    // Migration 14: Downloads — remember where a downloaded file lives
++    r#"
++    ALTER TABLE download_queue ADD COLUMN file_path TEXT;
++    ALTER TABLE download_queue ADD COLUMN quality TEXT DEFAULT '1080p';
++    ALTER TABLE download_queue ADD COLUMN file_size_bytes INTEGER;
++    ALTER TABLE download_queue ADD COLUMN download_id TEXT;
++    CREATE INDEX IF NOT EXISTS idx_download_queue_status ON download_queue(status);
++    "#,
+ ];
+ 
+ pub fn run_migrations(conn: &Connection) -> Result<()> {
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index b01231f..d65c53e 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -29,7 +29,7 @@ use tauri_plugin_opener::OpenerExt;
+ 
+ pub struct AppState {
+     pub db: Mutex<Database>,
+-    pub keep_awake: Mutex<Option<keepawake::KeepAwake>>,
++    pub keep_awake: Mutex<Option<crate::services::keep_awake::KeepAwake>>,
+     pub debug_mode: AtomicBool,
+     pub log_dir: std::path::PathBuf,
+     /// Pending auth callback from deep link (stored until frontend is ready)
+@@ -273,6 +273,9 @@ pub fn run() {
+             commands::youtube_api_search,
+             commands::youtube_validate_api_key,
+             commands::youtube_get_search_method,
++            commands::youtube_download,
++            commands::download_cancel,
++            commands::download_list,
+             commands::keep_awake_enable,
+             commands::keep_awake_disable,
+             commands::get_debug_mode,
+diff --git a/src-tauri/src/services/downloader.rs b/src-tauri/src/services/downloader.rs
+new file mode 100644
+index 0000000..0c16a5d
+--- /dev/null
++++ b/src-tauri/src/services/downloader.rs
+@@ -0,0 +1,541 @@
++//! Download service — saves YouTube videos into the local library folder and
++//! reports progress to the frontend through the `download:progress` event.
++//!
++//! Design notes:
++//! - yt-dlp writes progress with `--newline`; we parse the `[download]  42.3% ...`
++//!   lines and emit them, so the UI does not need its own parser.
++//! - The child process id is stored in a global registry so the frontend can
++//!   cancel a running download.
++//! - Output file name is `Artist - Title.ext`, which is exactly the convention
++//!   `LibraryScanner::parse_filename` understands.
++
++use serde::Serialize;
++use std::collections::HashMap;
++use std::path::{Path, PathBuf};
++use std::process::Stdio;
++use std::sync::{Mutex, OnceLock};
++use std::time::{SystemTime, UNIX_EPOCH};
++use std::time::Instant;
++
++use tauri::{AppHandle, Emitter, Runtime};
++use tokio::io::{AsyncBufReadExt, BufReader};
++use tokio::process::Command;
++
++use super::ytdlp::{find_ytdlp_path, get_expanded_path};
++
++pub const DOWNLOAD_PROGRESS_EVENT: &str = "download:progress";
++
++#[derive(Debug, Clone, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct DownloadProgress {
++    pub download_id: String,
++    pub video_id: String,
++    pub title: String,
++    /// queued | downloading | completed | failed | cancelled
++    pub status: String,
++    pub percent: f64,
++    pub speed: String,
++    pub eta: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub error: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub file_path: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub needs_restart: Option<bool>,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Quality {
++    Best1080,
++    P720,
++    AudioOnly,
++}
++
++impl Quality {
++    pub fn from_str(value: &str) -> Self {
++        match value {
++            "720p" => Quality::P720,
++            "audio" => Quality::AudioOnly,
++            _ => Quality::Best1080,
++        }
++    }
++
++    pub fn as_str(&self) -> &'static str {
++        match self {
++            Quality::Best1080 => "1080p",
++            Quality::P720 => "720p",
++            Quality::AudioOnly => "audio",
++        }
++    }
++
++    pub fn format_selector(&self) -> &'static str {
++        match self {
++            Quality::Best1080 => concat!(
++                "bv*[ext=mp4][vcodec^=avc1][height<=1080]+ba[ext=m4a]/",
++                "bv*[height<=1080]+ba/b[ext=mp4]/b"
++            ),
++            Quality::P720 => concat!(
++                "bv*[ext=mp4][vcodec^=avc1][height<=720]+ba[ext=m4a]/",
++                "b[ext=mp4][height<=720]/b[ext=mp4]/b"
++            ),
++            Quality::AudioOnly => "ba[ext=m4a]/ba",
++        }
++    }
++
++    pub fn is_audio(&self) -> bool {
++        matches!(self, Quality::AudioOnly)
++    }
++}
++
++/// Registry of running yt-dlp processes so downloads can be cancelled.
++#[derive(Default)]
++pub struct DownloadManager {
++    pids: Mutex<HashMap<String, u32>>,
++}
++
++impl DownloadManager {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    fn register(&self, id: &str, pid: u32) {
++        if let Ok(mut map) = self.pids.lock() {
++            map.insert(id.to_string(), pid);
++        }
++    }
++
++    fn unregister(&self, id: &str) {
++        if let Ok(mut map) = self.pids.lock() {
++            map.remove(id);
++        }
++    }
++
++    pub fn is_running(&self, id: &str) -> bool {
++        self.pids
++            .lock()
++            .map(|map| map.contains_key(id))
++            .unwrap_or(false)
++    }
++
++    /// Send SIGTERM to the yt-dlp process of `id`. Returns true when a process
++    /// was found and signalled.
++    pub fn cancel(&self, id: &str) -> bool {
++        let pid = self.pids.lock().ok().and_then(|mut map| map.remove(id));
++        match pid {
++            Some(pid) => std::process::Command::new("kill")
++                .arg("-TERM")
++                .arg(pid.to_string())
++                .status()
++                .map(|s| s.success())
++                .unwrap_or(false),
++            None => false,
++        }
++    }
++}
++
++/// Global manager — one per process, no extra AppState plumbing needed.
++pub fn manager() -> &'static DownloadManager {
++    static MANAGER: OnceLock<DownloadManager> = OnceLock::new();
++    MANAGER.get_or_init(DownloadManager::new)
++}
++
++pub fn new_download_id() -> String {
++    let ms = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_millis())
++        .unwrap_or(0);
++    format!("dl-{}", ms)
++}
++
++fn sanitize(part: &str) -> String {
++    let cleaned: String = part
++        .chars()
++        .map(|c| match c {
++            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
++            c if (c as u32) < 0x20 => '_',
++            c => c,
++        })
++        .collect();
++    let trimmed = cleaned.trim().trim_matches('.').to_string();
++    if trimmed.is_empty() {
++        "karaoke".to_string()
++    } else {
++        trimmed.chars().take(120).collect()
++    }
++}
++
++/// `Artist - Title` when we know the artist, plain title otherwise — this is the
++/// pattern the library scanner splits on.
++pub fn output_stem(title: &str, artist: Option<&str>) -> String {
++    let title = sanitize(title);
++    let artist = artist.map(str::trim).filter(|a| !a.is_empty()).map(sanitize);
++    match artist {
++        Some(artist) => {
++            // YouTube titles very often already read "Artist - Song"; prefixing the
++            // channel name again would produce "Artist - Artist - Song".
++            let lower_title = title.to_lowercase();
++            let already_names_artist =
++                lower_title.contains(" - ") || lower_title.starts_with(&artist.to_lowercase());
++            if already_names_artist {
++                title
++            } else {
++                format!("{} - {}", artist, title)
++                    .chars()
++                    .take(150)
++                    .collect()
++            }
++        }
++        None => title,
++    }
++}
++
++/// Parse one yt-dlp progress line: `[download]  42.3% of ~12.34MiB at 1.2MiB/s ETA 00:05`.
++/// Returns (percent, speed, eta).
++pub fn parse_progress(line: &str) -> Option<(f64, String, String)> {
++    if !line.starts_with("[download]") {
++        return None;
++    }
++    let percent_at = line.find('%')?;
++    let before = &line[..percent_at];
++    let digits: String = before
++        .chars()
++        .rev()
++        .take_while(|c| c.is_ascii_digit() || *c == '.')
++        .collect::<String>()
++        .chars()
++        .rev()
++        .collect();
++    let percent: f64 = digits.parse().ok()?;
++
++    let mut speed = String::new();
++    let mut eta = String::new();
++    if let Some(at) = line.find(" at ") {
++        let rest = &line[at + 4..];
++        let token = rest.split_whitespace().next().unwrap_or("");
++        if token.contains("/s") {
++            speed = token.to_string();
++        }
++    }
++    if let Some(eta_at) = line.find("ETA ") {
++        let rest = &line[eta_at + 4..];
++        eta = rest.split_whitespace().next().unwrap_or("").to_string();
++    }
++    Some((percent, speed, eta))
++}
++
++/// Locate the file yt-dlp just produced (or reused, when it skipped an existing file).
++pub fn find_output(dir: &Path, stem: &str) -> Option<PathBuf> {
++    const ALLOWED: [&str; 8] = ["mp4", "mkv", "webm", "mov", "m4a", "mp3", "opus", "flac"];
++    let entries = std::fs::read_dir(dir).ok()?;
++    let mut best: Option<(SystemTime, PathBuf)> = None;
++    for entry in entries.flatten() {
++        let path = entry.path();
++        let name = path.file_name()?.to_string_lossy().to_string();
++        if !name.starts_with(stem) {
++            continue;
++        }
++        let ext = path
++            .extension()
++            .map(|e| e.to_string_lossy().to_lowercase())
++            .unwrap_or_default();
++        if !ALLOWED.contains(&ext.as_str()) {
++            continue;
++        }
++        let modified = entry
++            .metadata()
++            .and_then(|m| m.modified())
++            .unwrap_or(UNIX_EPOCH);
++        if best.as_ref().map(|(t, _)| modified > *t).unwrap_or(true) {
++            best = Some((modified, path));
++        }
++    }
++    best.map(|(_, p)| p)
++}
++
++fn emit_progress<R: Runtime>(app: &AppHandle<R>, payload: DownloadProgress) {
++    let _ = app.emit(DOWNLOAD_PROGRESS_EVENT, payload);
++}
++
++/// Build the yt-dlp argument list. Exposed for tests.
++pub fn build_args(video_id: &str, dir: &Path, stem: &str, quality: Quality) -> Vec<String> {
++    let url = format!("https://www.youtube.com/watch?v={}", video_id);
++    let out_template = dir.join(format!("{}.%(ext)s", stem));
++    let mut args: Vec<String> = vec![
++        "--no-playlist".into(),
++        "--newline".into(),
++        "--no-warnings".into(),
++        "--retries".into(),
++        "5".into(),
++        "--fragment-retries".into(),
++        "5".into(),
++        "--concurrent-fragments".into(),
++        "4".into(),
++        "-o".into(),
++        out_template.to_string_lossy().to_string(),
++        "-f".into(),
++        quality.format_selector().into(),
++    ];
++    if quality.is_audio() {
++        args.extend(["-x".into(), "--audio-format".into(), "m4a".into()]);
++    } else {
++        args.extend([
++            "--merge-output-format".into(),
++            "mp4".into(),
++            "--embed-metadata".into(),
++            "--embed-thumbnail".into(),
++        ]);
++    }
++    if let Some(ffmpeg) = super::ytdlp::find_executable_in_path("ffmpeg") {
++        if let Some(parent) = ffmpeg.parent() {
++            args.push("--ffmpeg-location".into());
++            args.push(parent.to_string_lossy().to_string());
++        }
++    }
++    args.push(url);
++    args
++}
++
++/// Run one download to completion, emitting progress events.
++pub async fn download<R: Runtime>(
++    app: AppHandle<R>,
++    download_id: String,
++    video_id: String,
++    title: String,
++    artist: Option<String>,
++    dir: PathBuf,
++    quality: Quality,
++) -> Result<PathBuf, String> {
++    let Some(ytdlp) = find_ytdlp_path() else {
++        emit_progress(
++            &app,
++            DownloadProgress {
++                download_id,
++                video_id,
++                title,
++                status: "failed".into(),
++                percent: 0.0,
++                speed: String::new(),
++                eta: String::new(),
++                error: Some("yt-dlp 未安装".into()),
++                file_path: None,
++                needs_restart: None,
++            },
++        );
++        return Err("yt-dlp not found".into());
++    };
++
++    std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
++    let stem = output_stem(&title, artist.as_deref());
++
++    emit_progress(
++        &app,
++        DownloadProgress {
++            download_id: download_id.clone(),
++            video_id: video_id.clone(),
++            title: title.clone(),
++            status: "downloading".into(),
++            percent: 0.0,
++            speed: String::new(),
++            eta: String::new(),
++            error: None,
++            file_path: None,
++            needs_restart: None,
++        },
++    );
++
++    let args = build_args(&video_id, &dir, &stem, quality);
++    let mut command = Command::new(&ytdlp);
++    command
++        .args(&args)
++        .env("PATH", get_expanded_path())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped());
++
++    let mut child = command
++        .spawn()
++        .map_err(|e| format!("启动 yt-dlp 失败: {e}"))?;
++
++    if let Some(pid) = child.id() {
++        manager().register(&download_id, pid);
++    }
++
++    let started = Instant::now();
++    let mut tail: Vec<String> = Vec::new();
++
++    // stderr carries the final error message when yt-dlp fails.
++    let stderr = child.stderr.take();
++    let stderr_task = tauri::async_runtime::spawn(async move {
++        let mut collected = Vec::new();
++        if let Some(stderr) = stderr {
++            let mut reader = BufReader::new(stderr).lines();
++            while let Ok(Some(line)) = reader.next_line().await {
++                if !line.trim().is_empty() {
++                    collected.push(line);
++                    if collected.len() > 20 {
++                        collected.remove(0);
++                    }
++                }
++            }
++        }
++        collected
++    });
++
++    if let Some(stdout) = child.stdout.take() {
++        let mut reader = BufReader::new(stdout).lines();
++        let mut last_emit = Instant::now();
++        while let Ok(Some(line)) = reader.next_line().await {
++            if let Some((percent, speed, eta)) = parse_progress(&line) {
++                if last_emit.elapsed().as_millis() >= 250 || percent >= 100.0 {
++                    last_emit = Instant::now();
++                    emit_progress(
++                        &app,
++                        DownloadProgress {
++                            download_id: download_id.clone(),
++                            video_id: video_id.clone(),
++                            title: title.clone(),
++                            status: "downloading".into(),
++                            percent,
++                            speed: speed.clone(),
++                            eta: eta.clone(),
++                            error: None,
++                            file_path: None,
++                            needs_restart: None,
++                        },
++                    );
++                }
++                continue;
++            }
++            if !line.trim().is_empty() {
++                tail.push(line);
++                if tail.len() > 20 {
++                    tail.remove(0);
++                }
++            }
++        }
++    }
++
++    let status = child.wait().await.map_err(|e| format!("等待 yt-dlp 结束失败: {e}"))?;
++    manager().unregister(&download_id);
++    let stderr_lines = stderr_task.await.unwrap_or_default();
++    let _ = started;
++
++    if !status.success() {
++        let detail = stderr_lines
++            .last()
++            .cloned()
++            .or_else(|| tail.last().cloned())
++            .unwrap_or_else(|| format!("yt-dlp 退出码 {:?}", status.code()));
++        emit_progress(
++            &app,
++            DownloadProgress {
++                download_id: download_id.clone(),
++                video_id,
++                title,
++                status: "failed".into(),
++                percent: 0.0,
++                speed: String::new(),
++                eta: String::new(),
++                error: Some(detail.clone()),
++                file_path: None,
++                needs_restart: None,
++            },
++        );
++        return Err(detail);
++    }
++
++    let path = find_output(&dir, &stem)
++        .ok_or_else(|| "yt-dlp 结束但没有产出文件".to_string())?;
++
++    emit_progress(
++        &app,
++        DownloadProgress {
++            download_id,
++            video_id,
++            title,
++            status: "completed".into(),
++            percent: 100.0,
++            speed: String::new(),
++            eta: String::new(),
++            error: None,
++            file_path: Some(path.to_string_lossy().to_string()),
++            needs_restart: None,
++        },
++    );
++
++    Ok(path)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_progress_with_speed_and_eta() {
++        let line = "[download]  42.3% of ~12.34MiB at 1.23MiB/s ETA 00:05";
++        let (percent, speed, eta) = parse_progress(line).expect("should parse");
++        assert!((percent - 42.3).abs() < 0.01);
++        assert_eq!(speed, "1.23MiB/s");
++        assert_eq!(eta, "00:05");
++    }
++
++    #[test]
++    fn parses_finished_line() {
++        let line = "[download] 100% of 12.34MiB in 00:10";
++        let (percent, _, _) = parse_progress(line).expect("should parse");
++        assert!((percent - 100.0).abs() < 0.01);
++    }
++
++    #[test]
++    fn ignores_other_lines() {
++        assert!(parse_progress("[info] Downloading video thumbnail").is_none());
++        assert!(parse_progress("[youtube] extracting url").is_none());
++    }
++
++    #[test]
++    fn builds_artist_title_stem() {
++        assert_eq!(output_stem("後來", Some("劉若英")), "劉若英 - 後來");
++        assert_eq!(output_stem("後來", None), "後來");
++        assert_eq!(output_stem("a/b:c", Some("  ")), "a_b_c");
++        // 已经是 "Artist - Song" 形式时不再重复前缀
++        assert_eq!(output_stem("周杰倫 - 稻香", Some("周杰倫")), "周杰倫 - 稻香");
++        assert_eq!(output_stem("稻香", Some("周杰倫")), "周杰倫 - 稻香");
++    }
++
++    #[test]
++    fn build_args_targets_the_library_dir() {
++        let args = build_args("abc123", Path::new("/tmp/lib"), "A - B", Quality::P720);
++        assert!(args.iter().any(|a| a.contains("A - B.%(ext)s")));
++        assert!(args.iter().any(|a| a.contains("watch?v=abc123")));
++        assert!(args.iter().any(|a| a == "--merge-output-format"));
++    }
++    /// Real download through yt-dlp into a temp folder. Needs network, so it is
++    /// ignored in normal test runs:
++    ///   cargo test --lib downloads_a_real_video -- --ignored --nocapture
++    #[tokio::test]
++    #[ignore]
++    async fn downloads_a_real_video_into_the_folder() {
++        let app = tauri::test::mock_app();
++        let handle = app.handle().clone();
++        let dir = std::env::temp_dir().join("hkdl-native-e2e");
++        let _ = std::fs::remove_dir_all(&dir);
++
++        let path = download(
++            handle,
++            "e2e-1".to_string(),
++            "pau-7NYAWE8".to_string(),
++            "周杰倫 - 稻香".to_string(),
++            Some("周杰倫".to_string()),
++            dir,
++            Quality::AudioOnly,
++        )
++        .await
++        .expect("download should succeed");
++
++        assert!(path.exists(), "file should exist: {:?}", path);
++        let name = path.file_name().unwrap().to_string_lossy().to_string();
++        assert!(name.starts_with("周杰倫 - 稻香"), "unexpected name: {name}");
++        let size = std::fs::metadata(&path).unwrap().len();
++        assert!(size > 100_000, "file looks too small: {size} bytes");
++        println!("downloaded: {path:?} ({size} bytes)");
++    }
++}
+diff --git a/src-tauri/src/services/keep_awake.rs b/src-tauri/src/services/keep_awake.rs
+new file mode 100644
+index 0000000..a9e1158
+--- /dev/null
++++ b/src-tauri/src/services/keep_awake.rs
+@@ -0,0 +1,50 @@
++//! Keep-awake helper.
++//!
++//! Replaces the `keepawake` crate: on macOS it drives `/usr/bin/caffeinate`,
++//! which is exactly the same mechanism (power assertion) without pulling in a
++//! crate chain that generates IOKit bindings at build time (that build fails on
++//! newer Xcode SDKs because bindgen emits a dangling attribute).
++
++#[cfg(target_os = "macos")]
++pub struct KeepAwake {
++    child: std::process::Child,
++}
++
++#[cfg(target_os = "macos")]
++impl KeepAwake {
++    /// Prevent display and/or idle system sleep while `HomeKaraoke` runs.
++    pub fn create(display: bool, idle: bool) -> Result<Self, String> {
++        let mut command = std::process::Command::new("/usr/bin/caffeinate");
++        if display {
++            command.arg("-d");
++        }
++        if idle {
++            command.arg("-i");
++        }
++        // Tie the assertion to this process: caffeinate exits when we do.
++        command.arg("-w").arg(std::process::id().to_string());
++        let child = command
++            .spawn()
++            .map_err(|e| format!("caffeinate failed to start: {e}"))?;
++        Ok(Self { child })
++    }
++}
++
++#[cfg(target_os = "macos")]
++impl Drop for KeepAwake {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++/// Non-macOS builds keep the API but do nothing.
++#[cfg(not(target_os = "macos"))]
++pub struct KeepAwake;
++
++#[cfg(not(target_os = "macos"))]
++impl KeepAwake {
++    pub fn create(_display: bool, _idle: bool) -> Result<Self, String> {
++        Ok(Self)
++    }
++}
+diff --git a/src-tauri/src/services/mod.rs b/src-tauri/src/services/mod.rs
+index b595008..1dce098 100644
+--- a/src-tauri/src/services/mod.rs
++++ b/src-tauri/src/services/mod.rs
+@@ -1,3 +1,5 @@
++pub mod downloader;
++pub mod keep_awake;
+ pub mod ffmpeg;
+ pub mod library_scanner;
+ pub mod metadata_fetcher;
+diff --git a/src-tauri/tauri.conf.json b/src-tauri/tauri.conf.json
+index ad9fa26..ecd1dc6 100644
+--- a/src-tauri/tauri.conf.json
++++ b/src-tauri/tauri.conf.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+-  "productName": "HomeKaraoke",
++  "productName": "HomeKaraoke DL",
+   "version": "0.9.1",
+   "identifier": "app.homekaraoke",
+   "plugins": {
+@@ -22,7 +22,7 @@
+     "frontendDist": "../dist",
+     "devUrl": "http://localhost:1420",
+     "beforeDevCommand": "npm run dev",
+-    "beforeBuildCommand": "npm run build"
++    "beforeBuildCommand": "pnpm build"
+   },
+   "app": {
+     "windows": [
+@@ -64,7 +64,7 @@
+     ],
+     "macOS": {
+       "minimumSystemVersion": "10.15",
+-      "signingIdentity": "Developer ID Application: Piotr Zalewa (DCXDSQYXM7)",
++      "signingIdentity": "-",
+       "dmg": {
+         "background": "icons/dmg-background.png",
+         "windowSize": {
+@@ -107,4 +107,4 @@
+       "timestampUrl": ""
+     }
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/src/App.tsx b/src/App.tsx
+index a339a88..792ea7b 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -32,6 +32,7 @@ import { Shuffle, Trash2, ListRestart, Star, ListOrdered, Inbox } from "lucide-r
+ import { youtubeService, createLogger, getErrorMessage, runLegacyHostedSessionMigration, emitSignal, APP_SIGNALS } from "./services";
+ import { useMediaControls, useDisplayWatcher, useUpdateCheck, useKeyboardShortcuts } from "./hooks";
+ import { NotificationBar } from "./components/notification";
++import { DownloadPanel } from "./components/download";
+ import type { SearchResult } from "./types";
+ 
+ const log = createLogger("App");
+@@ -563,6 +564,9 @@ function App() {
+ 
+   return (
+     <AppLayout>
++      {/* Download progress panel (floating) */}
++      <DownloadPanel />
++
+       {/* Notification bar (bottom) */}
+       <NotificationBar />
+ 
+diff --git a/src/components/download/DownloadPanel.tsx b/src/components/download/DownloadPanel.tsx
+new file mode 100644
+index 0000000..dafb9ad
+--- /dev/null
++++ b/src/components/download/DownloadPanel.tsx
+@@ -0,0 +1,116 @@
++import { useEffect } from "react";
++import { Download, X, CheckCircle2, AlertTriangle } from "lucide-react";
++import { useDownloadStore, type DownloadItem } from "../../stores/downloadStore";
++
++function statusLabel(item: DownloadItem): string {
++  switch (item.status) {
++    case "queued":
++      return "排队中";
++    case "downloading":
++      return item.speed ? `${item.speed}${item.eta ? ` · 剩余 ${item.eta}` : ""}` : "下载中";
++    case "completed":
++      return item.needsRestart ? "完成（重启后生效）" : "完成";
++    case "failed":
++      return "失败";
++    case "cancelled":
++      return "已取消";
++    default:
++      return item.status;
++  }
++}
++
++/**
++ * Floating download progress panel.
++ *
++ * Mounted once at app level; it also wires the store to the backend
++ * `download:progress` event stream.
++ */
++export function DownloadPanel() {
++  const items = useDownloadStore((state) => state.items);
++  const init = useDownloadStore((state) => state.init);
++  const cancel = useDownloadStore((state) => state.cancel);
++  const remove = useDownloadStore((state) => state.remove);
++  const clearFinished = useDownloadStore((state) => state.clearFinished);
++
++  useEffect(() => {
++    void init();
++  }, [init]);
++
++  const list = Object.values(items);
++  if (list.length === 0) return null;
++
++  const active = list.filter(
++    (item) => item.status === "downloading" || item.status === "queued"
++  ).length;
++
++  return (
++    <div className="fixed bottom-4 right-4 z-50 w-80 rounded-lg border border-gray-700 bg-gray-800/95 shadow-xl backdrop-blur">
++      <div className="flex items-center gap-2 border-b border-gray-700 px-3 py-2">
++        <Download size={14} className="text-blue-400" />
++        <span className="text-sm font-medium text-white">下载队列</span>
++        <span className="text-xs text-gray-400">{active} 首进行中</span>
++        <button
++          onClick={clearFinished}
++          className="ml-auto text-xs text-gray-400 hover:text-gray-200"
++          title="清除已完成"
++        >
++          清除完成
++        </button>
++      </div>
++
++      <div className="max-h-64 overflow-y-auto">
++        {list.map((item) => {
++          const done = item.status === "completed";
++          const failed = item.status === "failed";
++          return (
++            <div key={item.downloadId} className="px-3 py-2 border-b border-gray-700/60 last:border-0">
++              <div className="flex items-start gap-2">
++                {done ? (
++                  <CheckCircle2 size={14} className="mt-0.5 shrink-0 text-green-400" />
++                ) : failed ? (
++                  <AlertTriangle size={14} className="mt-0.5 shrink-0 text-red-400" />
++                ) : (
++                  <Download size={14} className="mt-0.5 shrink-0 text-blue-400" />
++                )}
++                <div className="min-w-0 flex-1">
++                  <p className="truncate text-xs text-white" title={item.title}>
++                    {item.title}
++                  </p>
++                  <p className={`text-[11px] ${failed ? "text-red-400" : "text-gray-400"}`}>
++                    {failed && item.error ? item.error : statusLabel(item)}
++                  </p>
++                </div>
++                <span className="shrink-0 text-xs text-gray-400">
++                  {done ? "100%" : `${Math.round(item.percent)}%`}
++                </span>
++                <button
++                  onClick={() =>
++                    item.status === "downloading" || item.status === "queued"
++                      ? void cancel(item.downloadId)
++                      : remove(item.downloadId)
++                  }
++                  className="shrink-0 text-gray-500 hover:text-gray-200"
++                  title={
++                    item.status === "downloading" || item.status === "queued"
++                      ? "取消下载"
++                      : "从列表移除"
++                  }
++                >
++                  <X size={13} />
++                </button>
++              </div>
++              {!done && !failed && (
++                <div className="mt-1 h-1 w-full overflow-hidden rounded bg-gray-700">
++                  <div
++                    className="h-full bg-blue-500 transition-all"
++                    style={{ width: `${Math.max(2, item.percent)}%` }}
++                  />
++                </div>
++              )}
++            </div>
++          );
++        })}
++      </div>
++    </div>
++  );
++}
+diff --git a/src/components/download/index.ts b/src/components/download/index.ts
+new file mode 100644
+index 0000000..7b8a8eb
+--- /dev/null
++++ b/src/components/download/index.ts
+@@ -0,0 +1 @@
++export { DownloadPanel } from "./DownloadPanel";
+diff --git a/src/components/search/SearchResults.tsx b/src/components/search/SearchResults.tsx
+index 9de9b47..19b3abe 100644
+--- a/src/components/search/SearchResults.tsx
++++ b/src/components/search/SearchResults.tsx
+@@ -1,7 +1,7 @@
+ import { useRef, useEffect, useMemo, useState, useCallback, forwardRef, useImperativeHandle } from "react";
+ import { Settings } from "lucide-react";
+ import type { SearchResult } from "../../types";
+-import { usePlayerStore, useFavoritesStore, useSettingsStore, SETTINGS_KEYS, type Video } from "../../stores";
++import { usePlayerStore, useFavoritesStore, useSettingsStore, useDownloadStore, SETTINGS_KEYS, type Video } from "../../stores";
+ import { FavoriteStar } from "../favorites";
+ 
+ function searchResultToVideo(result: SearchResult): Video {
+@@ -60,6 +60,7 @@ export const SearchResults = forwardRef<SearchResultsRef, SearchResultsProps>(fu
+   const { currentVideo, isPlaying, nonEmbeddableVideoIds } = usePlayerStore();
+   const { persistentSingers, loadPersistentSingers } = useFavoritesStore();
+   const playbackMode = useSettingsStore((s) => s.getSetting(SETTINGS_KEYS.PLAYBACK_MODE));
++  const startDownload = useDownloadStore((s) => s.start);
+   const loadMoreRef = useRef<HTMLDivElement>(null);
+   const containerRef = useRef<HTMLDivElement>(null);
+   const [selectedIndex, setSelectedIndex] = useState(-1);
+@@ -327,6 +328,21 @@ export const SearchResults = forwardRef<SearchResultsRef, SearchResultsProps>(fu
+ 
+             {/* Actions */}
+             <div className="flex items-center gap-2">
++              <button
++                onClick={(e) => {
++                  e.stopPropagation();
++                  void startDownload({
++                    videoId: result.id,
++                    title: result.title,
++                    artist: result.channel,
++                  });
++                }}
++                className="w-8 h-8 flex items-center justify-center rounded text-base transition-colors bg-indigo-600 hover:bg-indigo-500"
++                aria-label="Download to local library"
++                title="下载到本地曲库（可离线唱）"
++              >
++                ⤓
++              </button>
+               {persistentSingers.length > 0 && !videoNonEmbeddable && (
+                 <FavoriteStar video={searchResultToVideo(result)} />
+               )}
+diff --git a/src/services/downloads.ts b/src/services/downloads.ts
+new file mode 100644
+index 0000000..b14a657
+--- /dev/null
++++ b/src/services/downloads.ts
+@@ -0,0 +1,74 @@
++import { invoke } from "@tauri-apps/api/core";
++import { listen, type UnlistenFn } from "@tauri-apps/api/event";
++import { createLogger } from "./logger";
++
++const log = createLogger("Downloads");
++
++export type DownloadStatus =
++  | "queued"
++  | "downloading"
++  | "completed"
++  | "failed"
++  | "cancelled";
++
++export interface DownloadProgress {
++  downloadId: string;
++  videoId: string;
++  title: string;
++  status: DownloadStatus;
++  percent: number;
++  speed: string;
++  eta: string;
++  error?: string;
++  filePath?: string;
++  needsRestart?: boolean;
++}
++
++export interface DownloadRow {
++  youtubeId: string;
++  title: string;
++  status: string;
++  progressPercent: number;
++  errorMessage?: string | null;
++  filePath?: string | null;
++  completedAt?: string | null;
++}
++
++export type DownloadQuality = "1080p" | "720p" | "audio";
++
++export const DOWNLOAD_PROGRESS_EVENT = "download:progress";
++
++export const downloadService = {
++  /**
++   * Start a download. Resolves with the download id as soon as yt-dlp is
++   * spawned; progress arrives through `onProgress`.
++   */
++  async start(params: {
++    videoId: string;
++    title: string;
++    artist?: string;
++    quality?: DownloadQuality;
++  }): Promise<string> {
++    log.info(`starting download: ${params.videoId} ${params.title}`);
++    return invoke<string>("youtube_download", {
++      videoId: params.videoId,
++      title: params.title,
++      artist: params.artist ?? null,
++      quality: params.quality ?? null,
++    });
++  },
++
++  async cancel(downloadId: string): Promise<boolean> {
++    return invoke<boolean>("download_cancel", { downloadId });
++  },
++
++  async list(): Promise<DownloadRow[]> {
++    return invoke<DownloadRow[]>("download_list");
++  },
++
++  onProgress(callback: (progress: DownloadProgress) => void): Promise<UnlistenFn> {
++    return listen<DownloadProgress>(DOWNLOAD_PROGRESS_EVENT, (event) =>
++      callback(event.payload)
++    );
++  },
++};
+diff --git a/src/services/index.ts b/src/services/index.ts
+index fe63f38..6a61ceb 100644
+--- a/src/services/index.ts
++++ b/src/services/index.ts
+@@ -44,6 +44,14 @@ export {
+   waitForSignal,
+   waitForSignalOrCondition,
+ } from "./appSignals";
++export {
++  downloadService,
++  DOWNLOAD_PROGRESS_EVENT,
++  type DownloadProgress,
++  type DownloadRow,
++  type DownloadStatus,
++  type DownloadQuality,
++} from "./downloads";
+ export type { SignalPayloads, AppSignalName, VideoMetadata, NextSongPayload, QueueOperationFailedPayload, HostingErrorPayload, FileAvailabilityPayload } from "./appSignals";
+ 
+ /**
+diff --git a/src/stores/downloadStore.ts b/src/stores/downloadStore.ts
+new file mode 100644
+index 0000000..d43b803
+--- /dev/null
++++ b/src/stores/downloadStore.ts
+@@ -0,0 +1,132 @@
++import { create } from "zustand";
++import { downloadService, createLogger, type DownloadProgress } from "../services";
++import { notify } from "./notificationStore";
++
++const log = createLogger("DownloadStore");
++
++export interface DownloadItem {
++  downloadId: string;
++  videoId: string;
++  title: string;
++  status: DownloadProgress["status"];
++  percent: number;
++  speed: string;
++  eta: string;
++  error?: string;
++  filePath?: string;
++  needsRestart?: boolean;
++}
++
++interface DownloadState {
++  items: Record<string, DownloadItem>;
++  initialized: boolean;
++  /** Subscribe to backend progress events (idempotent). */
++  init: () => Promise<void>;
++  start: (params: {
++    videoId: string;
++    title: string;
++    artist?: string;
++    quality?: "1080p" | "720p" | "audio";
++  }) => Promise<void>;
++  cancel: (downloadId: string) => Promise<void>;
++  clearFinished: () => void;
++  remove: (downloadId: string) => void;
++}
++
++let unlisten: (() => void) | null = null;
++
++export const useDownloadStore = create<DownloadState>((set, get) => ({
++  items: {},
++  initialized: false,
++
++  init: async () => {
++    if (unlisten) return;
++    unlisten = await downloadService.onProgress((progress) => {
++      const existing = get().items[progress.downloadId];
++      const item: DownloadItem = {
++        downloadId: progress.downloadId,
++        videoId: progress.videoId,
++        title: progress.title,
++        status: progress.status,
++        percent: progress.percent,
++        speed: progress.speed,
++        eta: progress.eta,
++        error: progress.error,
++        filePath: progress.filePath,
++        needsRestart: progress.needsRestart ?? existing?.needsRestart,
++      };
++      set((state) => ({ items: { ...state.items, [item.downloadId]: item } }));
++
++      if (progress.status === "completed") {
++        log.info(`downloaded: ${progress.filePath ?? progress.title}`);
++        notify(
++          "success",
++          progress.needsRestart
++            ? `已下载 ${progress.title}（重启 HomeKaraoke 后可在 Local 里播放）`
++            : `已下载 ${progress.title} → Local 曲库`
++        );
++      }
++      if (progress.status === "failed") {
++        log.warn(`download failed: ${progress.error}`);
++        notify("error", `下载失败：${progress.error ?? progress.title}`);
++      }
++    });
++    set({ initialized: true });
++  },
++
++  start: async (params) => {
++    try {
++      const downloadId = await downloadService.start(params);
++      set((state) => ({
++        items: {
++          ...state.items,
++          [downloadId]: {
++            downloadId,
++            videoId: params.videoId,
++            title: params.title,
++            status: "queued",
++            percent: 0,
++            speed: "",
++            eta: "",
++          },
++        },
++      }));
++    } catch (err) {
++      const message = err instanceof Error ? err.message : String(err);
++      log.warn(`start failed: ${message}`);
++      notify("error", `无法开始下载：${message}`);
++    }
++  },
++
++  cancel: async (downloadId) => {
++    await downloadService.cancel(downloadId);
++    set((state) => {
++      const item = state.items[downloadId];
++      if (!item) return state;
++      return {
++        items: {
++          ...state.items,
++          [downloadId]: { ...item, status: "cancelled", speed: "", eta: "" },
++        },
++      };
++    });
++  },
++
++  clearFinished: () =>
++    set((state) => {
++      const items: Record<string, DownloadItem> = {};
++      for (const [id, item] of Object.entries(state.items)) {
++        if (item.status === "downloading" || item.status === "queued") {
++          items[id] = item;
++        }
++      }
++      return { items };
++    }),
++
++  remove: (downloadId) =>
++    set((state) => {
++      const items = { ...state.items };
++      delete items[downloadId];
++      return { items };
++    }),
++}));
+diff --git a/src/stores/index.ts b/src/stores/index.ts
+index c87af68..9fbbb09 100644
+--- a/src/stores/index.ts
++++ b/src/stores/index.ts
+@@ -44,4 +44,5 @@ export {
+   type SearchMode,
+ } from "./libraryStore";
+ export { useSearchHistoryStore, type SearchType } from "./searchHistoryStore";
++export { useDownloadStore, type DownloadItem } from "./downloadStore";
+ export { useAuthStore, type AuthState } from "./authStore";
