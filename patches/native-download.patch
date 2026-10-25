@@ -19,10 +19,10 @@ index 8d61bdc..e38486b 100644
 +tauri = { version = "2", features = ["test"] }
 diff --git a/src-tauri/src/commands/downloads.rs b/src-tauri/src/commands/downloads.rs
 new file mode 100644
-index 0000000..76f56e7
+index 0000000..6a98519
 --- /dev/null
 +++ b/src-tauri/src/commands/downloads.rs
-@@ -0,0 +1,526 @@
+@@ -0,0 +1,533 @@
 +//! Download commands — download a YouTube song into the local library.
 +//!
 +//! `youtube_download` returns immediately with a download id; progress arrives
@@ -295,6 +295,12 @@ index 0000000..76f56e7
 +    let cookies = resolve_cookies(&state);
 +    let task_priority = Priority::from_str(priority.as_deref());
 +    let robust = resolve_robust(&state);
++    let preferred_index = state
++        .db
++        .lock()
++        .ok()
++        .and_then(|db| db.get_setting("download_strategy_index").ok().flatten())
++        .and_then(|v| v.parse::<usize>().ok());
 +    let cooldown = downloader::cooldown_remaining();
 +    if cooldown > 0 {
 +        match task_priority {
@@ -347,6 +353,7 @@ index 0000000..76f56e7
 +            cookies,
 +            task_priority,
 +            robust,
++            preferred_index,
 +        )
 +        .await;
 +
@@ -692,10 +699,10 @@ index b01231f..1788311 100644
              commands::get_debug_mode,
 diff --git a/src-tauri/src/services/downloader.rs b/src-tauri/src/services/downloader.rs
 new file mode 100644
-index 0000000..ae09542
+index 0000000..4f7c41d
 --- /dev/null
 +++ b/src-tauri/src/services/downloader.rs
-@@ -0,0 +1,1025 @@
+@@ -0,0 +1,1055 @@
 +//! Download service — saves YouTube videos into the local library folder and
 +//! reports progress to the frontend through the `download:progress` event.
 +//!
@@ -777,7 +784,9 @@ index 0000000..ae09542
 +                "bv*[ext=mp4][vcodec^=avc1][height<=720]+ba[ext=m4a]/",
 +                "b[ext=mp4][height<=720]/b[ext=mp4]/b"
 +            ),
-+            Quality::AudioOnly => "ba[ext=m4a]/ba",
++            // 加 /b 兜底：web_safari / mweb 客户端不一定提供纯音频流，
++            // 只写 ba 会直接报 "Requested format is not available"
++            Quality::AudioOnly => "ba[ext=m4a]/ba/b",
 +        }
 +    }
 +
@@ -1071,6 +1080,9 @@ index 0000000..ae09542
 +    pot_base: Option<&str>,
 +    client: Option<&str>,
 +    forced_format: Option<&str>,
++    fragments: u32,
++    chunk_size: Option<&str>,
++    sleep_interval: Option<u32>,
 +) -> Vec<String> {
 +    let url = format!("https://www.youtube.com/watch?v={}", video_id);
 +    let out_template = dir.join(format!("{}.%(ext)s", stem));
@@ -1084,21 +1096,15 @@ index 0000000..ae09542
 +        "5".into(),
 +    ];
 +
-+    if robust {
-+        // 稳健模式：把「十几路突发」压成「单路持续」，这是 403 的主因
-+        args.extend([
-+            "--concurrent-fragments".into(),
-+            "1".into(),
-+            "--http-chunk-size".into(),
-+            "10M".into(),
-+            "--sleep-interval".into(),
-+            "2".into(),
-+            "--sleep-requests".into(),
-+            "1".into(),
-+        ]);
-+    } else {
-+        args.extend(["--concurrent-fragments".into(), "4".into()]);
++    // 分片数由策略决定：实测 4 分片比 1 分片快约 15-20%，且不影响成功率
++    args.extend(["--concurrent-fragments".into(), fragments.to_string()]);
++    if let Some(chunk) = chunk_size {
++        args.extend(["--http-chunk-size".into(), chunk.to_string()]);
 +    }
++    if let Some(secs) = sleep_interval.filter(|s| *s > 0) {
++        args.extend(["--sleep-interval".into(), secs.to_string()]);
++    }
++    let _ = robust;
 +
 +    args.extend([
 +        "-o".into(),
@@ -1160,7 +1166,7 @@ index 0000000..ae09542
 +
 +// ---------------------------------------------------------------- 断路器
 +
-+use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 +
 +const COOLDOWN_SECS: u64 = 900;
 +const TRIP_WINDOW_SECS: u64 = 300;
@@ -1240,6 +1246,13 @@ index 0000000..ae09542
 +    }
 +}
 +
++/// 上一次成功的策略序号，供下一次优先使用（效率：避免重复试错）
++static LAST_OK_STRATEGY: AtomicUsize = AtomicUsize::new(0);
++
++pub fn last_ok_strategy() -> usize {
++    LAST_OK_STRATEGY.load(Ordering::SeqCst)
++}
++
 +/// 403 retry ladder: 8s → 30s → 120s.
 +const RETRY_DELAYS: [u64; 3] = [8, 30, 120];
 +
@@ -1255,6 +1268,7 @@ index 0000000..ae09542
 +    cookies: CookieSource,
 +    priority: Priority,
 +    robust: bool,
++    preferred_index: Option<usize>,
 +) -> Result<PathBuf, String> {
 +    let Some(ytdlp) = find_ytdlp_path() else {
 +        clear_inflight(&video_id);
@@ -1287,20 +1301,31 @@ index 0000000..ae09542
 +
 +    let pot_base = pot_base_url();
 +
-+    // 403 阶梯：默认客户端 → web_safari → mweb → 保底渐进式格式(360p)
-+    // 实测（2026-10）：默认 web 客户端下载 DASH 格式约 5MB 后必 403，
-+    // web_safari / mweb 可正常取全流；最后用 muxed 18 号格式兜底保证有文件。
-+    // 保底格式要跟着质量走：音频模式退到 ba/b，视频模式退到 muxed 18
++    // 策略表按「实测效率」排序（2026-10 基准，5:44 的 MV）：
++    //   web_safari 4 分片  1080p ~23s（45MB）  ← 成功率高、画质最好，放第一
++    //   mweb       4 分片   720p ~20s（16MB）  ← 最快、流量最省，放第二
++    //   默认客户端        必然 403（~15s 白等）← 降到最后兜底
++    //   --http-chunk-size 实测让 safari 从 23s 变 30s，故默认不用
 +    let fallback_format = if quality.is_audio() { "ba/b" } else { "18/b" };
-+    let strategies: [(Option<&str>, Option<&str>, &str); 4] = [
-+        (None, None, "默认客户端"),
-+        (Some("web_safari"), None, "web_safari"),
-+        (Some("mweb"), None, "mweb"),
-+        (Some("web_safari"), Some(fallback_format), "保底格式"),
++    let strategies: [(Option<&str>, Option<&str>, u32, Option<&str>, Option<u32>, &str); 4] = [
++        (Some("web_safari"), None, 4, None, Some(1), "web_safari·4片"),
++        (Some("mweb"), None, 4, None, Some(1), "mweb·4片"),
++        (None, None, 1, None, Some(1), "默认客户端"),
++        (Some("web_safari"), Some(fallback_format), 1, None, Some(1), "保底格式"),
 +    ];
++    // 上次成功的策略优先（存在 settings 里，避免每次都试错）
++    let mut order: Vec<usize> = (0..strategies.len()).collect();
++    if let Some(preferred) = preferred_index {
++        if preferred < strategies.len() {
++            order.retain(|i| *i != preferred);
++            order.insert(0, preferred);
++        }
++    }
 +
 +    let mut last_error = String::new();
-+    for (idx, (client, forced_format, label)) in strategies.iter().enumerate() {
++    for (attempt_no, strategy_idx) in order.iter().copied().enumerate() {
++        let (client, forced_format, fragments, chunk, sleep, label) = strategies[strategy_idx];
++        let idx = attempt_no;
 +        emit_progress(
 +            &app,
 +            DownloadProgress {
@@ -1312,7 +1337,7 @@ index 0000000..ae09542
 +                speed: if idx == 0 {
 +                    String::new()
 +                } else {
-+                    format!("换策略 {}/{}：{}", idx + 1, strategies.len(), label)
++                    format!("换策略 {}/{}：{}", idx + 1, order.len(), label)
 +                },
 +                eta: String::new(),
 +                error: None,
@@ -1329,14 +1354,17 @@ index 0000000..ae09542
 +            &cookies,
 +            robust,
 +            pot_base.as_deref(),
-+            *client,
-+            *forced_format,
++            client,
++            forced_format,
++            fragments,
++            chunk,
++            sleep,
 +        );
 +
 +        info!(
 +            "download[{download_id}]: attempt {}/{} with {}",
 +            idx + 1,
-+            strategies.len(),
++            order.len(),
 +            label
 +        );
 +
@@ -1390,6 +1418,7 @@ index 0000000..ae09542
 +                    needs_restart: None,
 +                },
 +            );
++            LAST_OK_STRATEGY.store(strategy_idx, std::sync::atomic::Ordering::SeqCst);
 +            info!("download[{download_id}]: done via {label} -> {:?}", path);
 +            return Ok(path);
 +        }
@@ -1619,6 +1648,7 @@ index 0000000..ae09542
 +                    CookieSource::None,
 +                    Priority::User,
 +                    true,
++                    None,
 +                )
 +                .await
 +            }
@@ -1645,6 +1675,9 @@ index 0000000..ae09542
 +            None,
 +            Some("web_safari"),
 +            Some("18/b"),
++            4,
++            None,
++            Some(1),
 +        );
 +        assert!(args
 +            .windows(2)
@@ -1675,14 +1708,17 @@ index 0000000..ae09542
 +            None,
 +            None,
 +            None,
++            4,
++            None,
++            Some(1),
 +        );
 +        assert!(args.iter().any(|a| a.contains("A - B.%(ext)s")));
 +        assert!(args.iter().any(|a| a.contains("watch?v=abc123")));
 +        assert!(args.iter().any(|a| a == "--merge-output-format"));
-+        // 稳健模式：单分片 + 分段 + 节流
-+        assert!(args.iter().any(|a| a == "--concurrent-fragments"));
-+        assert!(args.windows(2).any(|w| w[0] == "--http-chunk-size" && w[1] == "10M"));
-+        assert!(args.windows(2).any(|w| w[0] == "--sleep-interval" && w[1] == "2"));
++        // 分片数由策略决定；sleep 生效；未显式传 chunk 时不应出现分段参数
++        assert!(args.windows(2).any(|w| w[0] == "--concurrent-fragments" && w[1] == "4"));
++        assert!(args.windows(2).any(|w| w[0] == "--sleep-interval" && w[1] == "1"));
++        assert!(!args.iter().any(|a| a == "--http-chunk-size"));
 +    }
 +    /// Real download through yt-dlp into a temp folder. Needs network, so it is
 +    /// ignored in normal test runs:
@@ -1709,6 +1745,7 @@ index 0000000..ae09542
 +            },
 +            Priority::User,
 +            true,
++            None,
 +        )
 +        .await
 +        .expect("download should succeed");
